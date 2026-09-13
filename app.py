@@ -143,9 +143,10 @@ async def post_message(request: Request):
 
 
 @app.get('/feed')
-async def get_feed_route(room: str = None, limit: int = 2000):
+async def get_feed_route(room: str = None, limit: int = 50):
     """
-    Retrieves all messages stored across backend, decrypted and verified.
+    Retrieves the last `limit` messages (default 50), decrypted and verified.
+    Optionally filter by `room`. Results are returned oldest-first.
     """
     return store.get_feed(room_id=room, limit=limit)
 

@@ -3,4 +3,4 @@ uvicorn[standard]
 python-multipart
 websockets
 cryptography
-pymongo[srv]
+httpx

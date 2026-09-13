@@ -1,34 +1,40 @@
-import os
-import threading
-from typing import List, Dict, Any, Optional
+"""
+store.py — Message & Key Storage via SQLite REST DB Server
+==========================================================
+All persistence is delegated to a lightweight SQLite REST server
+running on the LAN (db_server.py).  No direct MongoDB dependency.
 
+Configuration (env vars):
+  DB_SERVER_URL  — base URL of the db_server  (default: http://127.0.0.1:5500)
+
+The HTTP client uses keep-alive connection pooling, so the per-request
+overhead is just one round-trip (~1-5 ms on LAN vs ~100-200 ms for Atlas).
+"""
+
+import os
+from typing import Dict, Any, List, Optional
+
+import httpx
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.asymmetric import ed25519
-from pymongo import MongoClient, ASCENDING, DESCENDING
-from pymongo.collection import Collection
 
 from server import crypto
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+DB_SERVER_URL: str = os.environ.get('DB_SERVER_URL', 'http://127.0.0.1:5500')
 
-MONGODB_URI = os.environ.get(
-    'MONGODB_URI',
-    'mongodb+srv://shashankyadavriiii_db_user:9Y2RNLoRD6OWSC4h@cluster0.7azo9pt.mongodb.net'
-)
-MONGODB_DB = os.environ.get('MONGODB_DB', 'group_chat')
+# Persistent HTTP client — connection-pooled, keep-alive, thread-safe
+_http = httpx.Client(base_url=DB_SERVER_URL, timeout=10.0)
 
-# Single MongoClient is thread-safe and connection-pooled
-_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-_db = _client[MONGODB_DB]
-
-# Collections
-_messages: Collection = _db['messages']
-_user_keys: Collection = _db['user_keys']
-
-# Create indexes once on startup
-_messages.create_index([('room_id', ASCENDING), ('timestamp', DESCENDING)])
-_user_keys.create_index('username', unique=True)
+# In-process public-key cache — avoids a round-trip for repeat senders
+_user_keys_cache: Dict[str, ed25519.Ed25519PublicKey] = {}
 
 
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 def _to_bytes(val) -> bytes:
     if isinstance(val, bytes):
         return val
@@ -46,44 +52,111 @@ def _to_hex(val) -> str:
     return str(val)
 
 
-_user_keys_cache: Dict[str, ed25519.Ed25519PublicKey] = {}
+def _decode_row(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Decrypt + verify a raw message row returned by the DB server.
+    Returns a dict suitable for /feed and /history responses.
+    """
+    msg_id    = doc['id']
+    sender    = doc.get('sender', 'Anonymous')
+    r_id      = doc.get('room_id', 'general')
+    timestamp = doc.get('timestamp', 0)
+    ciphertext = _to_bytes(doc.get('ciphertext', ''))
+    nonce      = _to_bytes(doc.get('nonce', ''))
+    signature  = _to_bytes(doc.get('signature', ''))
+
+    pub_key = get_user_public_key(sender)
+    signable_payload = crypto.make_signable_payload(
+        msg_id, r_id, sender, timestamp, nonce, ciphertext
+    )
+
+    # Verify Ed25519 signature
+    signature_valid = False
+    if pub_key:
+        signature_valid = crypto.verify_signature(pub_key, signature, signable_payload)
+
+    # Decrypt AES-GCM ciphertext
+    decrypted_text = None
+    decryption_valid = False
+    try:
+        decrypted_text = crypto.decrypt_message(ciphertext, nonce)
+        decryption_valid = True
+    except InvalidTag:
+        decrypted_text = '[TAMPERED: AES-GCM Integrity Check Failed]'
+    except Exception as exc:
+        decrypted_text = f'[DECRYPTION ERROR: {exc}]'
+
+    if not signature_valid and decryption_valid:
+        decrypted_text = f'[UNVERIFIED SIGNATURE] {decrypted_text}'
+
+    is_tampered = not (signature_valid and decryption_valid)
+
+    return {
+        'id':          msg_id,
+        'client-name': sender,
+        'username':    sender,
+        'msg':         decrypted_text,
+        'text':        decrypted_text,
+        'room':        r_id,
+        'timestamp':   timestamp,
+        'verified':    not is_tampered,
+        'tampered':    is_tampered,
+    }
+
 
 # ---------------------------------------------------------------------------
 # User public keys
 # ---------------------------------------------------------------------------
 def save_user_public_key(username: str, public_key_bytes: bytes) -> None:
+    """Upsert a user's Ed25519 public key into the DB server and local cache."""
     uname = username.lower()
+    # Update in-process cache first
     try:
         pub = ed25519.Ed25519PublicKey.from_public_bytes(public_key_bytes)
         _user_keys_cache[uname] = pub
     except Exception:
         pass
 
-    _user_keys.update_one(
-        {'username': uname},
-        {'$set': {'public_key': _to_hex(public_key_bytes)}},
-        upsert=True,
-    )
+    try:
+        _http.put(f'/user_keys/{uname}', json={'public_key': _to_hex(public_key_bytes)})
+    except Exception:
+        pass  # Non-fatal — cache will still serve future lookups
 
 
 def get_user_public_key(username: str) -> Optional[ed25519.Ed25519PublicKey]:
+    """
+    Lookup priority:
+      1. In-process cache
+      2. DB server  (GET /user_keys/{username})
+      3. Local disk keystore via crypto module (fallback / generates new key)
+    """
     uname = username.lower()
+
+    # 1. Cache hit
     if uname in _user_keys_cache:
         return _user_keys_cache[uname]
 
-    doc = _user_keys.find_one({'username': uname})
-    if doc:
-        raw_bytes = _to_bytes(doc['public_key'])
-        pub = ed25519.Ed25519PublicKey.from_public_bytes(raw_bytes)
-        _user_keys_cache[uname] = pub
-        return pub
+    # 2. DB server lookup
+    try:
+        resp = _http.get(f'/user_keys/{uname}')
+        if resp.status_code == 200:
+            data = resp.json()
+            raw_bytes = _to_bytes(data['public_key'])
+            pub = ed25519.Ed25519PublicKey.from_public_bytes(raw_bytes)
+            _user_keys_cache[uname] = pub
+            return pub
+    except Exception:
+        pass
 
-    # Fallback: generate/load from local keystore on disk
+    # 3. Fallback: generate / load from local disk keystore
     _, pub = crypto.get_or_create_sender_keys(username)
     _user_keys_cache[uname] = pub
     return pub
 
 
+# ---------------------------------------------------------------------------
+# Message storage
+# ---------------------------------------------------------------------------
 def save_message(
     msg_id: str,
     room_id: str,
@@ -93,18 +166,16 @@ def save_message(
     signature: bytes,
     timestamp: int,
 ) -> None:
-    _messages.update_one(
-        {'_id': msg_id},
-        {'$set': {
-            'room_id': room_id,
-            'sender': sender,
-            'ciphertext': _to_hex(ciphertext),
-            'nonce': _to_hex(nonce),
-            'signature': _to_hex(signature),
-            'timestamp': timestamp,
-        }},
-        upsert=True,
-    )
+    """POST a message to the DB server (upsert — dedup on `id`)."""
+    _http.post('/messages', json={
+        'id':         msg_id,
+        'room_id':    room_id,
+        'sender':     sender,
+        'ciphertext': _to_hex(ciphertext),
+        'nonce':      _to_hex(nonce),
+        'signature':  _to_hex(signature),
+        'timestamp':  timestamp,
+    })
 
 
 def append_message(
@@ -112,12 +183,16 @@ def append_message(
     msg: Dict[str, Any],
     sender_private_key: Optional[ed25519.Ed25519PrivateKey] = None,
 ) -> Dict[str, Any]:
-    msg_id = msg['id']
-    sender = msg.get('username') or msg.get('from')
-    text = msg['text']
+    """
+    Encrypt, sign, and durably store a message.
+    Returns a dict that the API can return directly to the caller.
+    """
+    msg_id    = msg['id']
+    sender    = msg.get('username') or msg.get('from')
+    text      = msg['text']
     timestamp = msg['timestamp']
 
-    # Ensure sender keys exist
+    # Resolve sender keys
     if sender_private_key is None:
         sender_private_key, sender_pub = crypto.get_or_create_sender_keys(sender)
     else:
@@ -129,146 +204,51 @@ def append_message(
     ciphertext, nonce = crypto.encrypt_message(text)
 
     # 2. Sign (Ed25519)
-    signable_payload = crypto.make_signable_payload(msg_id, room_id, sender, timestamp, nonce, ciphertext)
+    signable_payload = crypto.make_signable_payload(
+        msg_id, room_id, sender, timestamp, nonce, ciphertext
+    )
     signature = crypto.sign_message(sender_private_key, signable_payload)
 
-    # 3. Store in MongoDB
+    # 3. Store via DB server (POST /messages)
     save_message(msg_id, room_id, sender, ciphertext, nonce, signature, timestamp)
 
     return {
-        'id': msg_id,
-        'room': room_id,
-        'username': sender,
-        'text': text,
+        'id':        msg_id,
+        'room':      room_id,
+        'username':  sender,
+        'text':      text,
         'timestamp': timestamp,
-        'verified': True,
+        'verified':  True,
     }
 
 
+# ---------------------------------------------------------------------------
+# Message retrieval
+# ---------------------------------------------------------------------------
 def get_history(room_id: str, limit: int = 50) -> List[Dict[str, Any]]:
-    # Fetch newest N messages, then reverse for oldest-first display
-    cursor = _messages.find(
-        {'room_id': room_id},
-        sort=[('timestamp', DESCENDING)],
-        limit=limit,
-    )
-    rows = list(reversed(list(cursor)))
+    """Fetch the last `limit` messages for a room, decrypted and verified."""
+    try:
+        resp = _http.get('/messages', params={'room': room_id, 'limit': limit})
+        rows = resp.json()
+    except Exception:
+        return []
 
-    history = []
-    for doc in rows:
-        msg_id = doc['_id']
-        sender = doc['sender']
-        timestamp = doc['timestamp']
-        ciphertext = _to_bytes(doc['ciphertext'])
-        nonce = _to_bytes(doc['nonce'])
-        signature = _to_bytes(doc['signature'])
-
-        # 1. Verify Digital Signature (Ed25519)
-        pub_key = get_user_public_key(sender)
-        signable_payload = crypto.make_signable_payload(msg_id, room_id, sender, timestamp, nonce, ciphertext)
-
-        signature_valid = False
-        if pub_key:
-            signature_valid = crypto.verify_signature(pub_key, signature, signable_payload)
-
-        # 2. Decrypt (AES-GCM)
-        decrypted_text = None
-        decryption_valid = False
-        try:
-            decrypted_text = crypto.decrypt_message(ciphertext, nonce)
-            decryption_valid = True
-        except InvalidTag:
-            decrypted_text = '[TAMPERED: AES-GCM Integrity Check Failed - Ciphertext Modified]'
-        except Exception as e:
-            decrypted_text = f'[DECRYPTION ERROR: {e}]'
-
-        if not signature_valid and decryption_valid:
-            decrypted_text = f'[UNVERIFIED SIGNATURE] {decrypted_text}'
-
-        is_tampered = not (signature_valid and decryption_valid)
-
-        history.append({
-            'id': msg_id,
-            'username': sender,
-            'client-name': sender,
-            'text': decrypted_text,
-            'msg': decrypted_text,
-            'room': room_id,
-            'timestamp': timestamp,
-            'verified': not is_tampered,
-            'tampered': is_tampered,
-        })
-
-    return history
+    return [_decode_row(doc) for doc in rows]
 
 
-def get_feed(room_id: Optional[str] = None, limit: int = 2000) -> List[Dict[str, Any]]:
-    """Retrieve all messages (across all rooms or filtered) sorted chronologically."""
-    query = {}
+def get_feed(room_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+    """
+    Fetch the last `limit` messages across all rooms (or a specific room),
+    decrypted and signature-verified, returned oldest-first.
+    """
+    params: Dict[str, Any] = {'limit': limit}
     if room_id:
-        query['room_id'] = room_id
+        params['room'] = room_id
 
-    cursor = _messages.find(
-        query,
-        sort=[('timestamp', DESCENDING)],
-        limit=limit,
-    )
-    rows = list(reversed(list(cursor)))
+    try:
+        resp = _http.get('/messages', params=params)
+        rows = resp.json()
+    except Exception:
+        return []
 
-    # Prefetch missing public keys in a single bulk query
-    missing_senders = [
-        doc.get('sender', '').lower()
-        for doc in rows
-        if doc.get('sender', '').lower() and doc.get('sender', '').lower() not in _user_keys_cache
-    ]
-    if missing_senders:
-        for u_doc in _user_keys.find({'username': {'$in': list(set(missing_senders))}}):
-            try:
-                raw_bytes = _to_bytes(u_doc['public_key'])
-                _user_keys_cache[u_doc['username']] = ed25519.Ed25519PublicKey.from_public_bytes(raw_bytes)
-            except Exception:
-                pass
-
-    feed = []
-    for doc in rows:
-        msg_id = doc['_id']
-        sender = doc.get('sender', 'Anonymous')
-        r_id = doc.get('room_id', 'general')
-        timestamp = doc.get('timestamp', 0)
-        ciphertext = _to_bytes(doc.get('ciphertext', ''))
-        nonce = _to_bytes(doc.get('nonce', ''))
-        signature = _to_bytes(doc.get('signature', ''))
-
-        pub_key = get_user_public_key(sender)
-
-        signable_payload = crypto.make_signable_payload(msg_id, r_id, sender, timestamp, nonce, ciphertext)
-
-        signature_valid = False
-        if pub_key:
-            signature_valid = crypto.verify_signature(pub_key, signature, signable_payload)
-
-        decrypted_text = None
-        decryption_valid = False
-        try:
-            decrypted_text = crypto.decrypt_message(ciphertext, nonce)
-            decryption_valid = True
-        except InvalidTag:
-            decrypted_text = '[TAMPERED: AES-GCM Integrity Check Failed]'
-        except Exception as e:
-            decrypted_text = f'[DECRYPTION ERROR: {e}]'
-
-        is_tampered = not (signature_valid and decryption_valid)
-
-        feed.append({
-            'id': msg_id,
-            'client-name': sender,
-            'username': sender,
-            'msg': decrypted_text,
-            'text': decrypted_text,
-            'room': r_id,
-            'timestamp': timestamp,
-            'verified': not is_tampered,
-            'tampered': is_tampered,
-        })
-
-    return feed
+    return [_decode_row(doc) for doc in rows]
